@@ -1,0 +1,275 @@
+#!/usr/bin/python3
+"""Access to iCloud-synchronized keychain items.
+
+/usr/bin/security only talks to the file-based login.keychain, which is not
+synchronized through iCloud. Synchronized items live in the data-protection
+keychain and require kSecAttrSynchronizable=true on the SecItem* calls.
+
+Why python and not a compiled binary: reaching the data-protection keychain
+requires an entitlement a self-built binary does not have (ad-hoc signing with
+keychain-access-groups does not help — AMFI kills the process with SIGKILL).
+The system /usr/bin/python3 is signed by Apple, so the calls go through.
+
+  keychain-icloud set NAME       value is read from stdin (raw bytes)
+  keychain-icloud get NAME       value is written to stdout as is
+  keychain-icloud has NAME       exit code only: 0 — present, 1 — absent
+  keychain-icloud delete NAME
+  keychain-icloud list           names of every item of the service
+  keychain-icloud classes        "NAME<TAB>accessibility class", no values:
+                                 ck = AfterFirstUnlock (readable while the screen
+                                 is locked), ak = WhenUnlocked (out of reach for
+                                 nightly jobs)
+  keychain-icloud dump           every item as "NAME<TAB>base64(value)"
+                                 (single run — for loading an environment fast)
+
+The service defaults to claude-mcp, override with KEYCHAIN_ICLOUD_SERVICE.
+"""
+import ctypes
+import ctypes.util
+import os
+import sys
+
+SERVICE = os.environ.get("KEYCHAIN_ICLOUD_SERVICE", "claude-mcp")
+UTF8 = 0x08000100
+
+errSecSuccess = 0
+errSecItemNotFound = -25300
+errSecDuplicateItem = -25299
+
+_sec = ctypes.CDLL(ctypes.util.find_library("Security"))
+_cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+_cf.CFStringCreateWithBytes.restype = ctypes.c_void_p
+_cf.CFStringCreateWithBytes.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long,
+                                        ctypes.c_uint32, ctypes.c_bool]
+_cf.CFDataCreate.restype = ctypes.c_void_p
+_cf.CFDataCreate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long]
+_cf.CFDataGetLength.restype = ctypes.c_long
+_cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
+_cf.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_char)
+_cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+_cf.CFDictionaryCreateMutable.restype = ctypes.c_void_p
+_cf.CFDictionaryCreateMutable.argtypes = [ctypes.c_void_p, ctypes.c_long,
+                                          ctypes.c_void_p, ctypes.c_void_p]
+_cf.CFDictionarySetValue.argtypes = [ctypes.c_void_p] * 3
+_cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+_cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_cf.CFArrayGetCount.restype = ctypes.c_long
+_cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+_cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+_cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+_cf.CFStringGetLength.restype = ctypes.c_long
+_cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+_cf.CFStringGetCString.restype = ctypes.c_bool
+_cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+_cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+for _name in ("SecItemAdd", "SecItemUpdate", "SecItemDelete", "SecItemCopyMatching"):
+    getattr(_sec, _name).restype = ctypes.c_int32
+_sec.SecItemAdd.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_sec.SecItemUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_sec.SecItemDelete.argtypes = [ctypes.c_void_p]
+_sec.SecItemCopyMatching.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+_sec.SecCopyErrorMessageString.restype = ctypes.c_void_p
+_sec.SecCopyErrorMessageString.argtypes = [ctypes.c_int32, ctypes.c_void_p]
+
+_TRUE = ctypes.c_void_p.in_dll(_cf, "kCFBooleanTrue")
+
+
+def _const(name):
+    return ctypes.c_void_p.in_dll(_sec, name)
+
+
+def _cfstr(text):
+    raw = text.encode()
+    return ctypes.c_void_p(_cf.CFStringCreateWithBytes(None, raw, len(raw), UTF8, False))
+
+
+def _cfdata(raw):
+    return ctypes.c_void_p(_cf.CFDataCreate(None, raw, len(raw)))
+
+
+def _str_from_cf(ref):
+    if not ref:
+        return None
+    size = _cf.CFStringGetLength(ctypes.c_void_p(ref)) * 4 + 1
+    buf = ctypes.create_string_buffer(size)
+    if _cf.CFStringGetCString(ctypes.c_void_p(ref), buf, size, UTF8):
+        return buf.value.decode()
+    return None
+
+
+def _die(message, status=None):
+    text = "keychain-icloud: " + message
+    if status is not None:
+        detail = _str_from_cf(_sec.SecCopyErrorMessageString(status, None)) or ""
+        text += " (OSStatus %d%s)" % (status, ": " + detail if detail else "")
+    sys.stderr.write(text + "\n")
+    raise SystemExit(1)
+
+
+def _query(account=None, **extra):
+    d = ctypes.c_void_p(_cf.CFDictionaryCreateMutable(None, 0, None, None))
+    _cf.CFDictionarySetValue(d, _const("kSecClass"), _const("kSecClassGenericPassword"))
+    _cf.CFDictionarySetValue(d, _const("kSecAttrService"), _cfstr(SERVICE))
+    _cf.CFDictionarySetValue(d, _const("kSecAttrSynchronizable"), _TRUE)
+    if account is not None:
+        _cf.CFDictionarySetValue(d, _const("kSecAttrAccount"), _cfstr(account))
+    for key, value in extra.items():
+        _cf.CFDictionarySetValue(d, _const(key), value)
+    return d
+
+
+def set_secret(account, data):
+    status = _sec.SecItemUpdate(_query(account),
+                                _query_value_only(data))
+    if status == errSecSuccess:
+        return "updated"
+    if status != errSecItemNotFound:
+        _die("cannot update %s" % account, status)
+    add = _query(account, kSecValueData=_cfdata(data),
+                 kSecAttrDescription=_cfstr("Claude MCP secret (iCloud)"),
+                 kSecAttrAccessible=_const("kSecAttrAccessibleAfterFirstUnlock"))
+    status = _sec.SecItemAdd(add, None)
+    if status != errSecSuccess:
+        _die("cannot create %s" % account, status)
+    return "created"
+
+
+def _query_value_only(data):
+    d = ctypes.c_void_p(_cf.CFDictionaryCreateMutable(None, 0, None, None))
+    _cf.CFDictionarySetValue(d, _const("kSecValueData"), _cfdata(data))
+    # The accessibility class is set on update too, not only on creation:
+    # SecItemUpdate leaves kSecAttrAccessible alone, so items created before the
+    # switch to AfterFirstUnlock stayed WhenUnlocked and were unreadable for
+    # nightly jobs while the screen was locked (-25308).
+    _cf.CFDictionarySetValue(d, _const("kSecAttrAccessible"),
+                             _const("kSecAttrAccessibleAfterFirstUnlock"))
+    return d
+
+
+def get_secret(account):
+    out = ctypes.c_void_p()
+    status = _sec.SecItemCopyMatching(
+        _query(account, kSecReturnData=_TRUE, kSecMatchLimit=_const("kSecMatchLimitOne")),
+        ctypes.byref(out))
+    if status != errSecSuccess:
+        _die("cannot read %s" % account, status)
+    return ctypes.string_at(_cf.CFDataGetBytePtr(out), _cf.CFDataGetLength(out))
+
+
+def has_secret(account):
+    status = _sec.SecItemCopyMatching(
+        _query(account, kSecMatchLimit=_const("kSecMatchLimitOne")), ctypes.byref(ctypes.c_void_p()))
+    return status == errSecSuccess
+
+
+def delete_secret(account):
+    status = _sec.SecItemDelete(_query(account))
+    if status != errSecSuccess:
+        _die("cannot delete %s" % account, status)
+
+
+def list_secrets():
+    out = ctypes.c_void_p()
+    status = _sec.SecItemCopyMatching(
+        _query(None, kSecReturnAttributes=_TRUE, kSecMatchLimit=_const("kSecMatchLimitAll")),
+        ctypes.byref(out))
+    if status == errSecItemNotFound:
+        return []
+    if status != errSecSuccess:
+        _die("cannot list items", status)
+    names = []
+    for i in range(_cf.CFArrayGetCount(out)):
+        item = _cf.CFArrayGetValueAtIndex(out, i)
+        name = _str_from_cf(_cf.CFDictionaryGetValue(ctypes.c_void_p(item), _const("kSecAttrAccount")))
+        if name:
+            names.append(name)
+    return sorted(names)
+
+
+def list_classes():
+    """Name and kSecAttrAccessible of every item. Values are not requested, so
+    this works while the screen is locked — unlike dump."""
+    out = ctypes.c_void_p()
+    status = _sec.SecItemCopyMatching(
+        _query(None, kSecReturnAttributes=_TRUE, kSecMatchLimit=_const("kSecMatchLimitAll")),
+        ctypes.byref(out))
+    if status == errSecItemNotFound:
+        return []
+    if status != errSecSuccess:
+        _die("cannot read attributes", status)
+    rows = []
+    for i in range(_cf.CFArrayGetCount(out)):
+        item = ctypes.c_void_p(_cf.CFArrayGetValueAtIndex(out, i))
+        name = _str_from_cf(_cf.CFDictionaryGetValue(item, _const("kSecAttrAccount")))
+        accessible = _str_from_cf(_cf.CFDictionaryGetValue(item, _const("kSecAttrAccessible")))
+        if name:
+            rows.append((name, accessible or "?"))
+    return sorted(rows)
+
+
+def dump_secrets():
+    """Every item of the service in one call: name + base64 value."""
+    out = ctypes.c_void_p()
+    status = _sec.SecItemCopyMatching(
+        _query(None, kSecReturnAttributes=_TRUE, kSecReturnData=_TRUE,
+               kSecMatchLimit=_const("kSecMatchLimitAll")),
+        ctypes.byref(out))
+    if status == errSecItemNotFound:
+        return []
+    if status != errSecSuccess:
+        _die("cannot read items", status)
+    rows = []
+    for i in range(_cf.CFArrayGetCount(out)):
+        item = ctypes.c_void_p(_cf.CFArrayGetValueAtIndex(out, i))
+        name = _str_from_cf(_cf.CFDictionaryGetValue(item, _const("kSecAttrAccount")))
+        blob = _cf.CFDictionaryGetValue(item, _const("kSecValueData"))
+        if not name or not blob:
+            continue
+        raw = ctypes.string_at(_cf.CFDataGetBytePtr(ctypes.c_void_p(blob)),
+                               _cf.CFDataGetLength(ctypes.c_void_p(blob)))
+        rows.append((name, raw))
+    return sorted(rows)
+
+
+def main(argv):
+    if not argv:
+        _die("usage: keychain-icloud set|get|has|delete|list|classes|dump [NAME]")
+    command, rest = argv[0], argv[1:]
+    if command == "set":
+        if len(rest) != 1:
+            _die("usage: keychain-icloud set NAME  (value on stdin)")
+        data = sys.stdin.buffer.read()
+        if not data:
+            _die("empty value on stdin")
+        what = set_secret(rest[0], data)
+        sys.stderr.write("keychain-icloud: %s %s (%d bytes)\n" % (rest[0], what, len(data)))
+    elif command == "get":
+        if len(rest) != 1:
+            _die("usage: keychain-icloud get NAME")
+        sys.stdout.buffer.write(get_secret(rest[0]))
+    elif command == "has":
+        if len(rest) != 1:
+            _die("usage: keychain-icloud has NAME")
+        raise SystemExit(0 if has_secret(rest[0]) else 1)
+    elif command == "delete":
+        if len(rest) != 1:
+            _die("usage: keychain-icloud delete NAME")
+        delete_secret(rest[0])
+    elif command == "list":
+        for name in list_secrets():
+            print(name)
+    elif command == "classes":
+        for name, accessible in list_classes():
+            print("%s\t%s" % (name, accessible))
+    elif command == "dump":
+        import base64
+        for name, raw in dump_secrets():
+            print("%s\t%s" % (name, base64.b64encode(raw).decode()))
+    else:
+        _die("unknown command: %s" % command)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

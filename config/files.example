@@ -1,0 +1,4 @@
+# Secrets whose value is a whole file (OAuth credentials, service-account
+# JSON). Same format: one name per line.
+GOOGLE_CREDENTIALS_JSON
+GOOGLE_TOKEN_JSON

@@ -1,0 +1,5 @@
+# One environment variable name per line. Values live in the keychain,
+# never in this file.
+GITHUB_TOKEN
+OPENAI_API_KEY
+SOME_SERVICE_COOKIE
