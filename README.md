@@ -59,20 +59,34 @@ cd mcp-secrets-tools
 ```
 
 `install.sh` symlinks `bin/*` into `~/bin`, seeds `~/.config/mcp-secrets/` from
-the `.example` lists (existing files are left alone) and prints a snippet for
-`~/.bash_profile` / `~/.zshrc`.
+the `.example` lists (existing files are left alone) and prints a shell snippet.
+Paste that snippet into `~/.bash_profile` / `~/.zshrc` yourself — it defines the
+`mcp-secrets` function, and without it only `mcp-secrets load` stops working; the
+`claude` shim does not need it.
 
 Requirements: `~/bin` **before** `/opt/homebrew/bin` in `PATH` (otherwise the
 `claude` shim never intercepts the run), Command Line Tools (for
 `/usr/bin/python3`), and iCloud Keychain enabled.
 
-Then add the names you need to `~/.config/mcp-secrets/vars`, store the values,
-and check:
+Then store the secrets you need — `set` adds the name to
+`~/.config/mcp-secrets/vars` on its own — and check:
 
 ```sh
 mcp-secrets set MY_API_TOKEN
 mcp-secrets check
 ```
+
+Finally, reference them from your MCP config. A secret only reaches a server if
+its config asks for it — nothing is injected into the environment by name alone:
+
+```jsonc
+// ~/.claude.json
+"env": { "MY_API_TOKEN": "${MY_API_TOKEN}" }
+```
+
+From then on the `claude` shim loads the values for the duration of each Claude
+Code run. Ordinary shells stay clean on purpose; `mcp-secrets load` pulls the
+values into the current shell when you actually want them there.
 
 On a second Mac the values arrive with the keychain on their own — only
 `./install.sh` is needed there.
