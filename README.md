@@ -15,19 +15,26 @@ macOS only.
 | Component | Role |
 |---|---|
 | `bin/keychain-icloud` | access to synchronized keychain items: `set` / `get` / `has` / `delete` / `list` / `classes` / `dump` |
-| `bin/mcp-secrets` | task-shaped wrapper: list known secrets, `export` for the shell, file secrets, migrations |
-| `bin/claude` | shim that loads the secrets into the environment for the duration of a Claude Code run |
+| `bin/mcp-secrets` | task-shaped wrapper: list known secrets, `exec` launcher for MCP servers, `export` for the shell, file secrets, migrations |
+| `bin/claude` | shim that checks the secrets are readable before a Claude Code run (values stay out of its environment) |
 | `config/vars.example` | names of environment-variable secrets (names only, never values) |
 | `config/files.example` | names of file secrets (names only, never values) |
 
-Secrets do **not** end up in the environment of ordinary shells. They appear:
+Secrets do **not** end up in the environment of ordinary shells, nor in the
+environment of Claude Code itself. They appear:
 
-- inside the Claude Code process — via the `bin/claude` shim, which runs
-  `eval "$(mcp-secrets export)"` before `exec`;
-- in the current shell on demand — via the `mcp-secrets load` shell function;
-- inside an MCP server launched from a GUI app — via a small launcher of your
-  own, because a GUI app inherits no shell environment and does not expand
-  `${VAR}` in its config.
+- inside an MCP server — via `mcp-secrets exec`, which replaces `${VAR}` in the
+  server's arguments and environment with values from the keychain right before
+  `exec`. Each server gets only the secrets its own config names;
+- in the current shell on demand — via the `mcp-secrets load` shell function.
+
+Why not load everything into the Claude Code process: every shell command the
+agent runs inherits that environment, so one stray `env`, `set` or bare
+`export` prints every secret into the transcript. That did happen, hence the
+guards: `mcp-secrets export` refuses to write to a terminal or to run inside an
+agent session (`CLAUDECODE` / `CODEX_*` set; `MCP_SECRETS_ALLOW_EXPORT=1`
+overrides), and `keychain-icloud dump` writes only to a regular file.
+`mcp-secrets get NAME` still works — one named secret, asked for on purpose.
 
 In `~/.claude.json` a secret only ever appears as `"${VAR_NAME}"` in `env` (or in
 `headers` for http servers).
@@ -76,17 +83,29 @@ mcp-secrets set MY_API_TOKEN
 mcp-secrets check
 ```
 
-Finally, reference them from your MCP config. A secret only reaches a server if
-its config asks for it — nothing is injected into the environment by name alone:
+Finally, reference them from your MCP config and start the server through
+`mcp-secrets exec`. A secret only reaches a server if its config asks for it:
 
 ```jsonc
 // ~/.claude.json
-"env": { "MY_API_TOKEN": "${MY_API_TOKEN}" }
+"my-server": {
+  "command": "/Users/you/bin/mcp-secrets",
+  "args": ["exec", "/path/to/my-mcp-server", "--flag"],
+  "env": { "MY_API_TOKEN": "${MY_API_TOKEN}" }
+}
 ```
 
-From then on the `claude` shim loads the values for the duration of each Claude
-Code run. Ordinary shells stay clean on purpose; `mcp-secrets load` pulls the
-values into the current shell when you actually want them there.
+Claude Code leaves an unset `${VAR}` as is, so the placeholder reaches
+`mcp-secrets exec` untouched; a secret missing from the keychain stops the
+server with an explicit error instead of a quiet 401. The same entry works for
+Claude Desktop, which does not expand `${VAR}` at all. An http server with a
+secret header goes through a stdio bridge such as `mcp-remote` under
+`mcp-secrets exec` (`--header "Authorization:Bearer ${TOKEN}"`).
+
+The `claude` shim only verifies before each run that every listed secret is
+readable (`mcp-secrets verify`) and warns on stderr otherwise. Ordinary shells
+stay clean on purpose; `mcp-secrets load` pulls the values into the current
+shell when you actually want them there.
 
 On a second Mac the values arrive with the keychain on their own — only
 `./install.sh` is needed there.
@@ -96,10 +115,12 @@ On a second Mac the values arrive with the keychain on their own — only
 ```sh
 mcp-secrets list                      # what is configured, without values
 mcp-secrets check                     # everything readable and AfterFirstUnlock?
+mcp-secrets verify                    # quick readability check, prints no values
+mcp-secrets exec CMD [ARGS...]        # launch an MCP server with ${VAR}s filled in
 mcp-secrets set VAR                   # write/update, input hidden
 mcp-secrets get NAME                  # print a value
 mcp-secrets delete NAME
-mcp-secrets export                    # export lines for eval
+mcp-secrets export                    # export lines for eval (not on a tty, not in an agent)
 mcp-secrets load                      # shell function: load into the current shell
 
 mcp-secrets set-file NAME FILE         # store a file (json key, OAuth token)

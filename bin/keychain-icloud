@@ -20,7 +20,8 @@ The system /usr/bin/python3 is signed by Apple, so the calls go through.
                                  is locked), ak = WhenUnlocked (out of reach for
                                  nightly jobs)
   keychain-icloud dump           every item as "NAME<TAB>base64(value)"
-                                 (single run — for loading an environment fast)
+                                 (single run — for loading an environment fast;
+                                 stdout must be a regular file, not a tty/pipe)
 
 The service defaults to claude-mcp, override with KEYCHAIN_ICLOUD_SERVICE.
 """
@@ -265,6 +266,12 @@ def main(argv):
             print("%s\t%s" % (name, accessible))
     elif command == "dump":
         import base64
+        import stat
+        # Every value in one go is only for a private file (mcp-secrets writes a
+        # 0600 temporary one). To a terminal or a pipe it is one stray command
+        # away from a transcript or a log — refuse instead.
+        if not stat.S_ISREG(os.fstat(sys.stdout.fileno()).st_mode):
+            _die("dump writes only to a regular file (keychain-icloud dump > FILE)")
         for name, raw in dump_secrets():
             print("%s\t%s" % (name, base64.b64encode(raw).decode()))
     else:

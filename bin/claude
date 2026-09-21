@@ -1,8 +1,11 @@
 #!/bin/bash
-# Shim for Claude Code: pulls MCP secrets out of the keychain for the duration
-# of the claude run only, without polluting the environment of ordinary shells.
-# It works because ~/bin comes before ~/.local/bin in PATH, where the native
-# installer puts claude (and where claude updates itself).
+# Shim for Claude Code: checks that the MCP secrets in the keychain are readable
+# before the run. The values themselves do NOT go into claude's environment:
+# every shell command claude runs inherits that environment, and a single `env`
+# or `export` would then print all of them into the transcript. MCP servers are
+# started through `mcp-secrets exec`, which fills in only the ${VAR}s of that one
+# server. It works because ~/bin comes before ~/.local/bin in PATH, where the
+# native installer puts claude (and where claude updates itself).
 set -uo pipefail
 
 REAL="${CLAUDE_REAL_BIN:-$HOME/.local/bin/claude}"
@@ -13,16 +16,15 @@ if [ ! -x "$REAL" ]; then
     || { echo "claude-shim: real claude not found (override with CLAUDE_REAL_BIN)" >&2; exit 1; }
 fi
 
-# The failure is not silenced: without secrets the MCP servers start with empty
-# tokens and quietly answer 401 (that is how a nightly job once produced an empty
-# report and called it OK). The run is not blocked — claude is still useful with
-# some secrets missing — but the warning goes to stderr, and CLAUDE_SHIM_SECRETS
-# carries the outcome for anyone who wants to check.
-if secrets=$("$HOME/bin/mcp-secrets" export); then
+# The failure is not silenced: without secrets the MCP servers fail to start
+# (that is how a nightly job once produced an empty report and called it OK).
+# The run is not blocked — claude is still useful with some secrets missing —
+# but the warning goes to stderr, and CLAUDE_SHIM_SECRETS carries the outcome
+# for anyone who wants to check.
+if "$HOME/bin/mcp-secrets" verify; then
   export CLAUDE_SHIM_SECRETS=ok
 else
-  echo "claude-shim: MCP secrets are incomplete — some servers will run without tokens (locked keychain?)" >&2
+  echo "claude-shim: MCP secrets are incomplete — some servers will not start (locked keychain?)" >&2
   export CLAUDE_SHIM_SECRETS=partial
 fi
-eval "$secrets"
 exec "$REAL" "$@"
